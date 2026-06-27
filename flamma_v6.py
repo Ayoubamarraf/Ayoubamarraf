@@ -71,8 +71,8 @@ BARS              = 250
 RISK_PERCENT      = 1.0    # % of balance per trade (e.g. 1.0 = 1%)
 MAX_LOT           = 0.50   # Hard cap on lot size
 MIN_LOT           = 0.01
-MAX_DAILY_LOSS_PERCENT = 15.0  # للتجربة بالبالانس الصغير — يوقف عند خسارة $5
-MAX_DAILY_TRADES  = 5          # خمس صفقات يومياً فقط للتجربة
+MAX_DAILY_LOSS_PERCENT = 3.0   # Stop trading if daily loss > 3% of balance
+MAX_DAILY_TRADES  = 100        # Max trades per day
 
 # Indicators
 FAST_EMA          = 10
@@ -81,8 +81,8 @@ RSI_PERIOD        = 14
 ATR_PERIOD        = 14
 
 # Signal thresholds
-MIN_CONFIDENCE    = 7     # نرفعو الحد للتجربة — صفقات أقل بجودة أعلى
-SIGNAL_THRESHOLD  = 4     # نرفعو الحد كذلك
+MIN_CONFIDENCE    = 6     # Min confidence to take a trade (lower = more trades)
+SIGNAL_THRESHOLD  = 3     # Min |score| to generate a signal (lower = more trades)
 COOLDOWN_SECONDS  = 1800
 MAX_OPEN_POSITIONS = 1
 
