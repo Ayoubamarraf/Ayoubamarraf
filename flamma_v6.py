@@ -101,6 +101,7 @@ MANAGED_POSITIONS_FILE = DATA_DIR / "managed_positions.json"
 AI_STATE_FILE         = DATA_DIR / "ai_state.json"
 BRAIN_MEMORY_FILE     = DATA_DIR / "brain_memory.json"
 Q_TABLE_FILE          = DATA_DIR / "q_table.json"
+OPEN_TRADES_FILE      = DATA_DIR / "open_trades.json"
 ERROR_LOG_FILE        = LOG_DIR  / "errors.json"
 HEALER_STATE_FILE     = DATA_DIR / "healer_state.json"
 DAILY_STATS_FILE      = DATA_DIR / "daily_stats.json"
@@ -582,8 +583,10 @@ class SMCAnalyzer:
             return {"sell_side": [], "buy_side": []}
         highs = [float(to_float(r["high"])) for r in rates[-lookback:]]
         lows  = [float(to_float(r["low"]))  for r in rates[-lookback:]]
-        sell_liq = [float(highs[i]) for i in range(len(highs)) for j in range(i+1, len(highs)) if abs(highs[i] - highs[j]) < 0.001]
-        buy_liq  = [float(lows[i])  for i in range(len(lows))  for j in range(i+1, len(lows))  if abs(lows[i]  - lows[j])  < 0.001]
+        avg_price = sum(highs) / len(highs)
+        threshold = avg_price * 0.0003  # 0.03% relative — works for XAU (~0.6) and forex (~0.0003)
+        sell_liq = [float(highs[i]) for i in range(len(highs)) for j in range(i+1, len(highs)) if abs(highs[i] - highs[j]) < threshold]
+        buy_liq  = [float(lows[i])  for i in range(len(lows))  for j in range(i+1, len(lows))  if abs(lows[i]  - lows[j])  < threshold]
         return {"sell_side": list(set(sell_liq))[:5], "buy_side": list(set(buy_liq))[:5]}
 
     def get_signal(self, rates, current_price):
@@ -894,6 +897,46 @@ class SelfHealer:
 
 
 # ==============================================================================
+# SECTION 14B: WATCHDOG
+# ==============================================================================
+
+class Watchdog:
+    """
+    Monitors the main loop heartbeat.
+    If the loop is silent for max_silence seconds, reconnects MT5.
+    """
+
+    def __init__(self, max_silence: int = 120):
+        self.max_silence = max_silence
+        self._last_beat  = time.time()
+        self._stop       = Event()
+        self._thread     = Thread(target=self._run, daemon=True, name="Watchdog")
+
+    def start(self):
+        self._thread.start()
+        logging.info("Watchdog started")
+
+    def beat(self):
+        self._last_beat = time.time()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            time.sleep(15)
+            silence = time.time() - self._last_beat
+            if silence > self.max_silence:
+                logging.error(f"Watchdog: main loop silent for {int(silence)}s — reconnecting MT5")
+                healer.log_error(f"Watchdog triggered after {int(silence)}s silence")
+                try:
+                    safe_connect_mt5()
+                except Exception as e:
+                    logging.error(f"Watchdog reconnect failed: {e}")
+                self._last_beat = time.time()
+
+
+# ==============================================================================
 # SECTION 15: KIMI AI CLIENT
 # ==============================================================================
 
@@ -1164,6 +1207,110 @@ def manage_open_positions():
 
 
 # ==============================================================================
+# SECTION 18B: CLOSED TRADE TRACKER + GRACEFUL SHUTDOWN
+# ==============================================================================
+
+def check_closed_trades(modules: dict, guard: "DailyGuard"):
+    """
+    Detects positions that closed since last cycle.
+    Updates Q-Learning with actual reward and Brain memory.
+    """
+    try:
+        tracked = load_json_file(OPEN_TRADES_FILE, {})
+        if not tracked:
+            return
+
+        current_tickets = set()
+        positions = mt5.positions_get()
+        if positions:
+            current_tickets = {str(p.ticket) for p in positions}
+
+        closed_tickets = set(tracked.keys()) - current_tickets
+        if not closed_tickets:
+            return
+
+        # Fetch recent deal history (last 7 days)
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
+        deal_map = {}
+        if deals:
+            for d in deals:
+                deal_map[str(d.position_id)] = d
+
+        for ticket in closed_tickets:
+            meta    = tracked[ticket]
+            q_key   = meta.get("q_key", "")
+            action  = meta.get("direction", "BUY")
+            deal    = deal_map.get(ticket)
+
+            pnl     = float(deal.profit) if deal else 0.0
+            reward  = pnl / 10.0  # Normalize: $10 profit → reward=1.0
+
+            # Update Q-Learning with real outcome
+            if q_key:
+                modules["qlearning"].update(q_key, action, reward, q_key)
+                logging.info(f"Q-Learning updated: ticket={ticket} pnl={pnl} reward={round(reward,3)}")
+
+            # Brain learns from closed trade
+            modules["brain"].learn_from_trade({
+                "time":   datetime.now(timezone.utc).isoformat(),
+                "symbol": meta.get("symbol", ""),
+                "rsi":    meta.get("rsi", 50),
+                "atr":    meta.get("atr", 0),
+                "profit": pnl,
+            })
+
+            # Record PnL in daily guard
+            guard.record_trade(pnl=pnl)
+
+            status = "WIN" if pnl > 0 else "LOSS"
+            send_telegram_message(
+                f"[CLOSED] {meta.get('symbol','')} {action} | "
+                f"PnL: {round(pnl,2)} | {status} | Q-reward: {round(reward,2)}"
+            )
+
+            del tracked[ticket]
+
+        save_json_file(OPEN_TRADES_FILE, tracked)
+
+    except Exception as e:
+        healer.log_error(f"check_closed_trades: {e}")
+
+
+def close_all_positions():
+    """Graceful shutdown: close all open positions at market price."""
+    try:
+        positions = mt5.positions_get()
+        if not positions:
+            return
+        logging.info(f"Graceful shutdown: closing {len(positions)} position(s)")
+        for pos in positions:
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if tick is None:
+                continue
+            order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            price      = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
+            req = {
+                "action":       mt5.TRADE_ACTION_DEAL,
+                "symbol":       pos.symbol,
+                "position":     pos.ticket,
+                "volume":       pos.volume,
+                "type":         order_type,
+                "price":        price,
+                "deviation":    DEVIATION,
+                "magic":        MAGIC,
+                "comment":      "SHUTDOWN_CLOSE",
+                "type_time":    mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            r = mt5.order_send(req)
+            status = "OK" if (r and r.retcode == mt5.TRADE_RETCODE_DONE) else f"FAILED retcode={getattr(r,'retcode','?')}"
+            send_telegram_message(f"[SHUTDOWN] {pos.symbol} ticket={pos.ticket} → {status}")
+    except Exception as e:
+        healer.log_error(f"close_all_positions: {e}")
+
+
+# ==============================================================================
 # SECTION 19: SIGNAL BUILDING (CORE LOGIC)
 # ==============================================================================
 
@@ -1381,7 +1528,7 @@ def has_open_positions() -> bool:
         return False
 
 
-def execute_trade(signal: dict, guard: DailyGuard, modules: dict):
+def execute_trade(signal: dict, guard: DailyGuard, modules: dict, kimi: "KimiClient" = None):
     symbol     = signal["symbol"]
     direction  = signal["type"]
     sl         = signal["sl"]
@@ -1401,6 +1548,21 @@ def execute_trade(signal: dict, guard: DailyGuard, modules: dict):
         balance = account.balance if account else 10000.0
         guard.set_start_balance(balance)
         lot = calculate_dynamic_lot(symbol, sl, entry_price, balance)
+
+        # Kimi AI signal review (non-blocking if API down)
+        if kimi and kimi.enabled:
+            context = {
+                "balance":   round(balance, 2),
+                "daily_pnl": round(guard.stats.get("pnl", 0), 2),
+                "h4":        meta.get("h4"),
+                "score":     signal.get("confidence"),
+            }
+            review = kimi.review_signal(signal, context)
+            if not review.get("approve", True):
+                reason_ai = review.get("reasoning", "No reason")[:200]
+                logging.info(f"Kimi rejected signal: {reason_ai}")
+                send_telegram_message(f"[KIMI] Signal rejected\n{reason_ai}")
+                return
 
         if not LIVE_TRADING:
             msg = (
@@ -1465,9 +1627,16 @@ def execute_trade(signal: dict, guard: DailyGuard, modules: dict):
             save_json_file(LAST_TRADE_FILE, {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()})
             guard.record_trade()
 
-            # Q-Learning update with 0 reward (will be updated on close)
-            modules["qlearning"].update(meta.get("q_key", ""), direction, 0.0, meta.get("q_key", ""))
-            modules["brain"].learn_from_trade(trade_data)
+            # Track position for real reward update when it closes
+            open_trades = load_json_file(OPEN_TRADES_FILE, {})
+            open_trades[str(result.order)] = {
+                "q_key":     meta.get("q_key", ""),
+                "direction": direction,
+                "symbol":    symbol,
+                "rsi":       meta.get("rsi", 50),
+                "atr":       meta.get("atr", 0),
+            }
+            save_json_file(OPEN_TRADES_FILE, open_trades)
 
             send_telegram_message(
                 f"[TRADE EXECUTED] Flamma v6\n"
@@ -1492,7 +1661,7 @@ def execute_trade(signal: dict, guard: DailyGuard, modules: dict):
 # SECTION 21: BACKTEST ENGINE
 # ==============================================================================
 
-def run_backtest(csv_path: str = "backtests/data.csv"):
+def run_backtest(csv_path: str = "backtests/data.csv", symbol: str = "XAUUSDm"):
     """
     Full backtest using the same signal logic as the live bot.
     Reads CSV with columns: time, open, high, low, close
@@ -1535,11 +1704,29 @@ def run_backtest(csv_path: str = "backtests/data.csv"):
     print(f"[OK] Loaded {len(rows)} candles")
 
     # Backtest parameters (same as live)
-    cfg = SETTINGS_BY_SYMBOL.get("XAUUSDm", SETTINGS_BY_SYMBOL["XAUUSDm"])
+    cfg = SETTINGS_BY_SYMBOL.get(symbol, SETTINGS_BY_SYMBOL["XAUUSDm"])
     SL_ATR_MULT = cfg["sl_atr_mult"]
     TP_RR       = cfg["tp_rr"]
     RISK_PCT    = RISK_PERCENT / 100.0
     START_BAL   = 10000.0
+
+    # Symbol-specific P&L constants
+    # point_size: smallest price increment
+    # units_per_lot: contract size (affects $ value per price unit)
+    POINT_SIZE = {
+        "XAUUSDm":  0.01,
+        "EURUSDm":  0.00001,
+        "GBPUSDm":  0.00001,
+        "USDJPYm":  0.001,
+    }.get(symbol, 0.01)
+    UNITS_PER_LOT = {
+        "XAUUSDm":  100,       # 100 oz per lot → $100 per $1 move per lot
+        "EURUSDm":  100000,    # 100k units → $10 per pip per lot
+        "GBPUSDm":  100000,
+        "USDJPYm":  100000,    # approximate (ignores JPY conversion)
+    }.get(symbol, 100)
+
+    print(f"[OK] Symbol: {symbol} | point={POINT_SIZE} | units/lot={UNITS_PER_LOT}")
 
     balance    = START_BAL
     trades     = []
@@ -1582,8 +1769,8 @@ def run_backtest(csv_path: str = "backtests/data.csv"):
                 pnl_points = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
                 lot = open_trade["lot"]
 
-                # Simplified P&L (XAU: 1 point ≈ $1 per 0.01 lot, i.e., $10/lot)
-                pnl = pnl_points * lot * 10
+                # P&L = price_change * units_per_lot * lot
+                pnl = pnl_points * UNITS_PER_LOT * lot
                 balance += pnl
                 status  = "TP" if hit_tp else "SL"
                 trades.append({
@@ -1606,8 +1793,8 @@ def run_backtest(csv_path: str = "backtests/data.csv"):
             continue  # Already in trade
 
         # --- Signal logic (mirrors live bot) ---
-        atr_pts     = atr / 0.01       # Assuming XAU with point=0.01
-        ema_gap_pts = abs(fast - slow) / 0.01
+        atr_pts     = atr / POINT_SIZE
+        ema_gap_pts = abs(fast - slow) / POINT_SIZE
         rsi_ok_buy  = 55 <= rsi <= 65
         rsi_ok_sell = 35 <= rsi <= 45
 
@@ -1632,10 +1819,10 @@ def run_backtest(csv_path: str = "backtests/data.csv"):
             sl = price + sl_dist
             tp = price - tp_dist
 
-        # Dynamic lot
+        # Dynamic lot: risk_usd = sl_distance * UNITS_PER_LOT * lot
         risk_usd = balance * RISK_PCT
-        sl_pts = abs(price - sl) / 0.01
-        lot = risk_usd / (sl_pts * 0.1) if sl_pts > 0 else MIN_LOT
+        sl_dist  = abs(price - sl)
+        lot = risk_usd / (sl_dist * UNITS_PER_LOT) if sl_dist > 0 else MIN_LOT
         lot = max(MIN_LOT, min(MAX_LOT, round(lot, 2)))
 
         open_trade = {
@@ -1652,7 +1839,7 @@ def run_backtest(csv_path: str = "backtests/data.csv"):
         last_price = rows[-1]["close"]
         direction  = open_trade["type"]
         pnl_pts    = (last_price - open_trade["entry"]) if direction == "BUY" else (open_trade["entry"] - last_price)
-        pnl        = pnl_pts * open_trade["lot"] * 10
+        pnl        = pnl_pts * UNITS_PER_LOT * open_trade["lot"]
         balance   += pnl
         trades.append({
             "entry": open_trade["entry"], "exit": last_price,
@@ -1757,6 +1944,10 @@ def main():
         print("[FATAL] Cannot connect to MT5")
         return
 
+    # Start Watchdog
+    watchdog = Watchdog(max_silence=120)
+    watchdog.start()
+
     send_telegram_message(
         f"[OK] Flamma v6.0 started\n"
         f"LIVE={LIVE_TRADING} | Risk={RISK_PERCENT}% | MaxDD={MAX_DAILY_LOSS_PERCENT}%\n"
@@ -1794,6 +1985,12 @@ def main():
                 )
                 last_status_time = time.time()
 
+            # Watchdog heartbeat
+            watchdog.beat()
+
+            # Detect closed trades → update Q-Learning reward
+            check_closed_trades(modules, guard)
+
             # Manage open positions
             manage_open_positions()
 
@@ -1816,8 +2013,8 @@ def main():
                 time.sleep(30)
                 continue
 
-            # Execute
-            execute_trade(signal, guard, modules)
+            # Execute (with Kimi AI review)
+            execute_trade(signal, guard, modules, kimi=kimi)
 
             # Periodic optimizer
             optimizer.run()
@@ -1826,7 +2023,11 @@ def main():
 
         except KeyboardInterrupt:
             print("[STOP] Bot stopped by user")
-            send_telegram_message("[STOP] Flamma v6.0 stopped by user")
+            watchdog.stop()
+            if LIVE_TRADING:
+                print("[STOP] Closing all open positions...")
+                close_all_positions()
+            send_telegram_message("[STOP] Flamma v6.0 stopped by user — all positions closed")
             break
 
         except Exception as e:
@@ -1853,7 +2054,8 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "backtest":
-        csv_file = sys.argv[2] if len(sys.argv) > 2 else "backtests/data.csv"
-        run_backtest(csv_file)
+        csv_file   = sys.argv[2] if len(sys.argv) > 2 else "backtests/data.csv"
+        sym_arg    = sys.argv[3] if len(sys.argv) > 3 else "XAUUSDm"
+        run_backtest(csv_file, symbol=sym_arg)
     else:
         main()
